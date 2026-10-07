@@ -30,8 +30,10 @@ function clearStorage(key){
 window.clearStorage = clearStorage;
 
 function renderTabs(){
+  const pending = INBOX.tags.length;
   document.getElementById('tabs').innerHTML = Object.keys(META).map(k=>
-    `<button class="tab ${k===tab?'active':''}" onclick="switchTab('${k}')">${META[k].name}</button>`).join('');
+    `<button class="tab ${k===tab?'active':''}" onclick="switchTab('${k}')">${META[k].name}</button>`).join('')
+    + `<button class="tab ${tab==='inbox'?'active':''}" onclick="switchTab('inbox')">未分類タグ${pending?` (${pending})`:''}</button>`;
 }
 function switchTab(k){ tab=k; render(); }
 window.switchTab = switchTab;
@@ -313,7 +315,172 @@ function renderWorks(){
 function render(){
   renderTabs();
   const m = document.getElementById('main');
-  m.innerHTML = META[tab].flat ? renderFlat(tab) : renderWorks();
+  m.innerHTML = tab==='inbox' ? renderInbox() : (META[tab].flat ? renderFlat(tab) : renderWorks());
 }
+
+
+// ---------- x_bookmarker 連携: 未分類タグ ----------
+// x_bookmarker の「カテゴリ未設定タグを書き出し」で作った JSON を読み込み、
+// カテゴリ(とキャラなら作品)を選ぶだけで各JSONへ追加できる。
+const INBOX_KEY = STORAGE_PREFIX+'inbox';
+const INBOX = {tags:[]}; // {name,count,cat,id,work}
+const CAT_OPTIONS = [
+  ['','（未選択）'], ['work','作品'], ['char','キャラクター'], ['attribute','属性'], ['costume','コスチューム'], ['situation','シチュ'],
+];
+const nkey = s => String(s==null?'':s).normalize('NFKC').toLowerCase().trim();
+function saveInbox(){ try{ localStorage.setItem(INBOX_KEY, JSON.stringify(INBOX)); }catch(e){} }
+function loadInbox(){
+  try{ const raw = localStorage.getItem(INBOX_KEY); if(raw){ const d = JSON.parse(raw); if(Array.isArray(d.tags)) INBOX.tags = d.tags; } }catch(e){}
+}
+/** 既に登録済みの名前(作品/キャラ/属性/コスチューム/シチュ。別名も含む)のキー集合 */
+function registeredKeys(){
+  const set = new Set();
+  const add = it => { if(!it) return; set.add(nkey(it.name)); (it.aliases||[]).forEach(a=>set.add(nkey(a))); };
+  ['works','attribute','costume','situation'].forEach(k=>{
+    if(!DB[k]) return;
+    DB[k].items.forEach(it=>{ add(it); (it.characters||[]).forEach(add); });
+  });
+  return set;
+}
+function loadInboxFile(input){
+  const f = input.files[0]; if(!f) return;
+  const r = new FileReader();
+  r.onload = () => {
+    try{
+      const d = JSON.parse(r.result);
+      if(d.kind!=='xbm-uncategorized-tags' || !Array.isArray(d.tags)) throw new Error('x_bookmarkerの「カテゴリ未設定タグを書き出し」で作ったJSONではありません');
+      const have = new Set(INBOX.tags.map(t=>nkey(t.name)));
+      const reg = registeredKeys();
+      let add=0, skipReg=0;
+      d.tags.forEach(t=>{
+        const name = String(t&&t.name||'').trim();
+        if(!name || have.has(nkey(name))) return;
+        if(reg.has(nkey(name))){ skipReg++; return; }
+        INBOX.tags.push({name, count:Number(t.count)||0, cat:'', id:'', work:''});
+        have.add(nkey(name)); add++;
+      });
+      INBOX.tags.sort((a,b)=>b.count-a.count || a.name.localeCompare(b.name,'ja'));
+      saveInbox();
+      INBOX.msg = `${add}件を追加${skipReg?`（登録済みのため${skipReg}件は除外）`:''}`;
+      render();
+    }catch(e){ alert('読み込みエラー: '+e.message); }
+  };
+  r.readAsText(f,'utf-8');
+  input.value='';
+}
+window.loadInboxFile = loadInboxFile;
+function setInbox(i, field, val){
+  INBOX.tags[i][field] = val;
+  if(field==='cat' && val!=='char') INBOX.tags[i].work='';
+  saveInbox(); render();
+}
+window.setInbox = setInbox;
+function removeInbox(i){ INBOX.tags.splice(i,1); saveInbox(); render(); }
+window.removeInbox = removeInbox;
+function clearInbox(){
+  if(!confirm('未分類タグの一覧をすべて消去しますか？（各JSONには影響しません）')) return;
+  INBOX.tags = []; saveInbox(); render();
+}
+window.clearInbox = clearInbox;
+function bulkCat(cat){
+  INBOX.tags.forEach(t=>{ if(!t.cat){ t.cat = cat; if(cat!=='char') t.work=''; } });
+  saveInbox(); render();
+}
+window.bulkCat = bulkCat;
+
+/** idの自動生成: 名前から決まる短い英数字 (重複したら連番) */
+function autoId(prefix, name, used){
+  let h = 5381;
+  for(const ch of name) h = ((h*33) ^ ch.codePointAt(0)) >>> 0;
+  const base = prefix + h.toString(36);
+  let id = base, n = 2;
+  while(used.has(id)) id = base + '_' + (n++);
+  return id;
+}
+function usedIds(cat){
+  const used = new Set();
+  if(cat==='work'||cat==='char'){
+    if(DB.works) DB.works.items.forEach(w=>{ if(cat==='work') used.add(w.id); (w.characters||[]).forEach(c=>{ if(cat==='char') used.add(c.id); }); });
+  } else if(DB[cat]) DB[cat].items.forEach(it=>used.add(it.id));
+  return used;
+}
+const CAT_JSON = {work:'works', char:'works', attribute:'attribute', costume:'costume', situation:'situation'};
+const ID_PREFIX = {work:'w_', char:'c_', attribute:'a_', costume:'k_', situation:'s_'};
+
+function applyInbox(){
+  const targets = INBOX.tags.filter(t=>t.cat);
+  const box = document.getElementById('inbox-msg');
+  if(!targets.length){ box.innerHTML='<div class="msg warn">カテゴリを選んだタグがありません</div>'; return; }
+  // 事前チェック (何も変更せずに全部検証する)
+  const errs = [];
+  const need = new Set(targets.map(t=>CAT_JSON[t.cat]));
+  need.forEach(k=>{ if(!DB[k]) errs.push(`「${META[k].name}」タブでJSONを読み込んでください`); });
+  const plan = [];
+  const used = {work:usedIds('work'), char:usedIds('char'), attribute:usedIds('attribute'), costume:usedIds('costume'), situation:usedIds('situation')};
+  targets.forEach(t=>{
+    if(t.cat==='char'){
+      if(!DB.works) return;
+      const w = DB.works.items.find(x=>x.id===t.work);
+      if(!w){ errs.push(`「${t.name}」: 所属する作品を選んでください`); return; }
+    }
+    let id = (t.id||'').trim();
+    if(id){
+      if(!IDRE.test(id)){ errs.push(`「${t.name}」: idは半角英数字とアンダーバーのみです`); return; }
+      if(used[t.cat].has(id)){ errs.push(`「${t.name}」: idが重複しています (${id})`); return; }
+    } else id = autoId(ID_PREFIX[t.cat], t.name, used[t.cat]);
+    used[t.cat].add(id);
+    plan.push({t, id});
+  });
+  if(errs.length){ box.innerHTML = errs.map(e=>`<div class="msg err">${esc(e)}</div>`).join(''); return; }
+  plan.forEach(({t,id})=>{
+    if(t.cat==='work') DB.works.items.push({id, name:t.name, characters:[]});
+    else if(t.cat==='char') DB.works.items.find(x=>x.id===t.work).characters.push({id, name:t.name});
+    else DB[t.cat].items.push({id, name:t.name});
+  });
+  need.forEach(k=>saveDB(k));
+  const done = new Set(plan.map(p=>p.t));
+  INBOX.tags = INBOX.tags.filter(t=>!done.has(t));
+  saveInbox();
+  INBOX.msg = `${plan.length}件を追加しました。各タブでJSONをダウンロードしてリポジトリに反映してください`;
+  render();
+}
+window.applyInbox = applyInbox;
+
+function renderInbox(){
+  const msg = INBOX.msg ? `<div class="msg ok">${esc(INBOX.msg)}</div>` : '';
+  INBOX.msg = '';
+  const workOptions = (sel)=> '<option value="">-- 作品を選択 --</option>' + (DB.works?DB.works.items:[]).map(w=>`<option value="${esc(w.id)}" ${w.id===sel?'selected':''}>${esc(w.name)}</option>`).join('');
+  const rows = INBOX.tags.map((t,i)=>`
+    <div class="item">
+      <div class="row">
+        <div style="flex:2;min-width:120px"><b>${esc(t.name)}</b> <span class="small">${t.count}件</span></div>
+        <select onchange="setInbox(${i},'cat',this.value)">${CAT_OPTIONS.map(([v,l])=>`<option value="${v}" ${v===t.cat?'selected':''}>${l}</option>`).join('')}</select>
+        <button class="ghost" onclick="removeInbox(${i})">除外</button>
+      </div>
+      ${t.cat?`<div class="row" style="margin-top:6px">
+        ${t.cat==='char'?`<select onchange="setInbox(${i},'work',this.value)" style="flex:1 1 140px">${workOptions(t.work)}</select>`:''}
+        <input type="text" placeholder="id（空欄で自動）" value="${esc(t.id)}" onchange="setInbox(${i},'id',this.value.trim())">
+      </div>`:''}
+    </div>`).join('');
+  const nSet = INBOX.tags.filter(t=>t.cat).length;
+  return `<div class="card">
+    <h3>未分類タグ（x_bookmarkerから連携）— ${INBOX.tags.length}件</h3>
+    <div class="small" style="margin-bottom:8px">x_bookmarkerの「カテゴリ未設定タグを書き出し（jsonmaker用）」で作ったJSONを読み込みます。カテゴリを選んで「選択分を各JSONに追加」を押すと反映されます。追加先のJSON（作品/属性/コスチューム/シチュ）は先に各タブで読み込んでおいてください。</div>
+    <input type="file" accept=".json" onchange="loadInboxFile(this)">
+    ${msg}
+    <div id="inbox-msg"></div>
+  </div>
+  ${INBOX.tags.length?`<div class="card">
+    <div class="row" style="margin-bottom:8px"><span class="small">未選択を一括:</span>
+      ${CAT_OPTIONS.filter(o=>o[0]).map(([v,l])=>`<button class="sec" onclick="bulkCat('${v}')">${l}</button>`).join('')}
+    </div>
+    ${rows}
+    <div style="margin-top:10px" class="row">
+      <button onclick="applyInbox()" ${nSet?'':'disabled'}>選択分(${nSet}件)を各JSONに追加</button>
+      <button class="ghost" onclick="clearInbox()">一覧を消去</button>
+    </div>
+  </div>`:''}`;
+}
+loadInbox();
 loadAllFromStorage();
 render();
